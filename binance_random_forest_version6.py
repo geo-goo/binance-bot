@@ -1,16 +1,15 @@
 #%%
 import ccxt.async_support as ccxt
-import logging
+from loguru import logger
 import pandas as pd
 import numpy as np
 import talib
 import asyncio
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import cross_val_score
+from sklearn.model_selection import train_test_split , cross_val_score
 from tqdm import tqdm
 import joblib
 from binance_settting import api, secret
-from decimal import Decimal
 import optuna
 import warnings
 from sklearn.metrics import accuracy_score
@@ -18,37 +17,23 @@ from sklearn.metrics import accuracy_score
 warnings.filterwarnings("ignore")
 pd.options.mode.chained_assignment = None
 
-logging.basicConfig(level=logging.DEBUG)
-log_format = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-
-error_logger = logging.getLogger('error_logger')
-error_logger.setLevel(logging.ERROR)
-f_error = logging.FileHandler('error.log')
-f_error.setLevel(logging.ERROR)
-f_error.setFormatter(log_format)
-error_logger.addHandler(f_error)
-
-info_logger = logging.getLogger('info_logger')
-info_logger.setLevel(logging.INFO)
-f_info = logging.FileHandler('info.log')
-f_info.setLevel(logging.INFO)
-f_info.setFormatter(log_format)
-info_logger.addHandler(f_info)
+logger.add("log/error.log", level="ERROR", rotation="10 MB", format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {message}")
+logger.add("log/trade.log", level="INFO", rotation="10 MB", format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {message}")
 
 class TradingBot:
     def __init__(self):
         self.exchange = None
         self.balance = None
-        self.symbol = 'BTC/USDT'
+        self.symbols = ['BTC/USDT'] 
         self.positions = 0
         self.add_position = 0.001
-        self.max_positions = 5
+        self.max_positions = 1
         self.risk_percentage = 0.01
         self.model = None
         self.best_params = None
-    
+            
         # kelly criterion
-        self.probability = 0.5
+        self.probability = 0.8
         self.win_ratio = None
         self.profit_ratio = 1.2
 
@@ -64,6 +49,19 @@ class TradingBot:
 
     def kelly_criterion(self, win_ratio, profit_ratio):
         return (win_ratio * (profit_ratio + 1) - 1) / profit_ratio
+
+    def optimize_kelly_criterion(self):
+        def objective(trial):
+            win_ratio = trial.suggest_uniform('win_ratio', 0.5, 0.9)
+            profit_ratio = trial.suggest_uniform('profit_ratio', 1.0, 2.0)
+            kelly_ratio = self.kelly_criterion(win_ratio, profit_ratio)
+            return kelly_ratio
+
+        study = optuna.create_study(direction='maximize')
+        study.optimize(objective, n_trials=100)
+        best_params = study.best_params
+        self.win_ratio = best_params['win_ratio']
+        self.profit_ratio = best_params['profit_ration']
 
     async def load_model(self):
         try:
@@ -98,41 +96,35 @@ class TradingBot:
             model = RandomForestClassifier(**trial.params)
             score = np.mean([cross_val_score(model, features, labels, cv=3) for _ in range(3)])
             return score  
-         
-        try :
-            data = await self.exchange.fetch_ohlcv(self.symbol, '1m', limit=100)
-            df = self.prepare_features(data)
-            df['label'] = self.prepare_labels(df)
-            features = df.drop(columns=['time', 'open', 'volume', 'label'])
-            labels = df['label']
+        
+        for symbol in self.symbols : 
+            try :
+                data = await self.exchange.fetch_ohlcv(symbol, '1m', limit=10000)
+                df = self.prepare_features(data)
+                df['label'] = self.prepare_labels(df)
+                features = df.drop(columns=['time', 'label'],axis=1)
+                labels = df['label']
+                study = optuna.create_study(direction='maximize')
+                study.optimize(objective, n_trials=1)
+                best_params = study.best_params
+                if self.model is None:
+                    self.model = RandomForestClassifier(**best_params)
+                else :
+                    self.model.set_params(**best_params)
 
-            study = optuna.create_study(direction='maximize')
-            study.optimize(objective, n_trials=5)
-            best_params = study.best_params
-            if self.model is None:
-                self.model = RandomForestClassifier(**best_params)
-            else :
-                self.model.set_params(**best_params)
+                X_train, X_test, y_train, y_test = train_test_split(features, labels, test_size=0.2, random_state=42)
+                self.train_model(X_train, y_train, pbar)
 
-            self.train_model(features, labels, pbar)
+                await self.predict(X_test,y_test,X_test['close'].tail(1),symbol)
+                pbar.close()
 
-            # data = await self.exchange.fetch_ohlcv(self.symbol, '1d', limit=200)
-            # df = self.prepare_features(data)
-            # df['label'] = self.prepare_labels(df)
-            # features = df.drop(columns=['time', 'open', 'volume', 'label'])
-            # labels = df['label']
-
-            await self.predict(features,labels)
-            pbar.close()
-
-        except Exception as e:
-            error_logger.error(e)
-            await asyncio.sleep(0.5)
+            except Exception as e:
+                logger.error(str(e))
+                await asyncio.sleep(0.5)
 
     def prepare_features(self, data):
         df = pd.DataFrame(data, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
         
-        # 定义要添加的技术指标列表
         indicators = [
             talib.RSI(df['close'],timeperiod=9), # RSI
             talib.MACD(df['close'])[0],  # MACD
@@ -201,7 +193,6 @@ class TradingBot:
             talib.WILLR(df['high'], df['low'], df['close']),  # 三重指数平滑移动平均线趋势强度指标
         ]
         
-        # 将指标添加到数据框中
         for i, indicator in enumerate(indicators):
             column_name = f'indicator_{i+1}getLogger'
             df[column_name] = indicator
@@ -220,10 +211,10 @@ class TradingBot:
             pbar.update(1)
             print('Model trained and saved.')
         except Exception as e:
-            error_logger.error(str(e))
+            logger.error(str(e))
             print('An error occurred while training the model. Please check the log file for details.')
 
-    async def predict(self, features , labels):
+    async def predict(self, features , labels , price , symbol):
         try:
             prediction = self.model.predict(features)
             accuracy = accuracy_score(labels, prediction)
@@ -238,25 +229,31 @@ class TradingBot:
                     # kelly criterian
                     amount  = self.balance['USDT']['free'] * self.kelly_criterion(self.win_ratio, self.profit_ratio) * self.risk_percentage
                     print(f'Here is {amount}')
-                    await self.exchange.create_market_buy_order(self.symbol, amount)
-                    await self.exchange.create_limit_buy_order(self.symbol, amount)
-                    info_logger.info(f'Bought {self.symbol} {amount} at market price')
-                    print(f'Bought {self.symbol} {amount} at market price')
+                    await self.exchange.create_market_buy_order(symbol, amount)
+                    # await self.exchange.create_limit_buy_order(symbol, amount, price)
+                    logger.info(f'Bought {symbol} {amount} at limit buy price')
+                    print(f'Bought {symbol} about {amount} at limit buy price')
                 else:
                     print('Maximum number of positions reached')
             else:
                 if self.positions > 0:
-                    # amount = Decimal(self.balance[self.symbol.split('/')[0]]['free']) * Decimal(self.add_position)
-                    amount  = self.balance[self.symbol.split('/')[0]]['free'] * self.kelly_criterion(self.win_ratio, self.profit_ratio) * self.add_position
+                    # amount = Decimal(self.balance[symbol.split('/')[0]]['free']) * Decimal(self.add_position)
+                    amount  = self.balance[symbol.split('/')[0]]['free'] * self.kelly_criterion(self.win_ratio, self.profit_ratio) * self.add_position
                     print(f'Here is {amount}')
-                    await self.exchange.create_market_sell_order(self.symbol, amount)
+                    # await self.exchange.create_market_sell_order(symbol, amount)
+                    await self.exchange.create_limit_sell_order(symbol, amount, price)
                     self.positions -= 1
-                    info_logger.info(f'Sold {self.symbol} {amount} at market price')
-                    print(f'Sold {self.symbol} {amount} at market price')
+                    logger.info(f'Sold {symbol} {amount} at limit sell price')
+                    print(f'Sold {symbol} about {amount} at limit sell price')
                 else:
                     print('No positions to sell')
+
+        # except ConversionSyntax as e:
+        #     logger.error(str(e))
+        #     print("ConversionSyntax 异常：", str(e))
+        
         except Exception as e:
-            error_logger.error(str(e))
+            logger.error(str(e))
             print('An error occurred while making predictions. Please check the log file for details.')
 
 async def main():
@@ -266,14 +263,12 @@ async def main():
     finally:
         await bot.exchange.close()
 
-
 if __name__ == '__main__':
-
     while True :
         try :
             print(f'Trading Bot starting...')
             asyncio.run(main())
         except Exception as e:
-            error_logger.error(str(e))
+            logger.error(str(e))
 
 
